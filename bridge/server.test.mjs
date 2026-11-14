@@ -6932,6 +6932,19 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(localAgentCreateOptions(input).tools).toEqual(["mcp"]);
   });
 
+  it("appends admitted Cursor web search builtins to the MCP allowlist", () => {
+    const input = {
+      apiKey: "test-key",
+      model: "composer-2.5",
+      workingDirectory: "/tmp/project",
+      clientTools: [],
+      builtinTools: ["webSearch", "webFetch"]
+    };
+
+    expect(localAgentCreateOptions(input).tools).toEqual(["mcp", "webSearch", "webFetch"]);
+    expect(localAgentCreateOptions({ ...input, builtinTools: undefined }).tools).toEqual(["mcp"]);
+  });
+
   it("maps legacy fast aliases and Agent CLI bracket parameters to SDK params", () => {
     const input = {
       apiKey: "test-key",

@@ -46,6 +46,44 @@ describe("Cursor SDK harness", () => {
     });
   });
 
+  it("forwards admitted Responses web_search builtins to the Bridge", async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    const prepared = prepareResponsesRequest({
+      model: "composer-2.5",
+      input: "search recent Cursor SDK news",
+      tools: [{ type: "web_search" }],
+      stream: true,
+      store: false
+    }, { id: "composer-2.5" });
+    const completion = await createCursorSdkCompletion(
+      { CURSOR_SDK_BRIDGE_URL: "http://bridge.test/sdk" } as any,
+      {
+        now: () => new Date("2026-08-22T11:30:00Z"),
+        randomUUID: () => crypto.randomUUID(),
+        fetch: async (_input, init) => {
+          requestBody = JSON.parse(String(init?.body));
+          return Response.json({ text: "done", toolCalls: [], status: "completed" });
+        }
+      },
+      "cursor-test-key",
+      {
+        prompt: prepared.prompt,
+        model: prepared.cursorModel,
+        clientTools: prepared.tools,
+        builtinTools: prepared.builtinTools,
+        sessionKey: "web-search-builtins"
+      }
+    );
+
+    await collectCursorSdkOutput(completion.stream);
+    expect(prepared.builtinTools).toEqual(["webSearch", "webFetch"]);
+    expect(requestBody).toMatchObject({
+      promptAlreadyPrepared: true,
+      tools: [],
+      builtinTools: ["webSearch", "webFetch"]
+    });
+  });
+
   it("hashes and forwards Responses Agent context metadata", async () => {
     let requestBody: Record<string, any> | undefined;
     const prepared = prepareResponsesRequest({

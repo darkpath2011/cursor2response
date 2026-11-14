@@ -45,6 +45,32 @@ affinity. See [Responses Agent context affinity](responses-agent-context-affinit
 Conformance covers both response modes, tool-result continuation with phased
 history, stable message identity, and classification when trace recording fails.
 
+## Responses server search tools
+
+Bare Responses `tools` entries `{ "type": "web_search" }` and
+`{ "type": "web_search_preview" }` admit Cursor SDK builtins `webSearch` and
+`webFetch` on `Agent.create` / `Agent.resume` (alongside the existing `mcp`
+allowlist used for client function tools). Search executes inside Cursor; the
+gateway does not forward search as client `customTools`.
+
+Unsupported today and rejected with `400 unsupported_parameter`:
+
+- `{ "type": "x_search" }` (no Cursor SDK mapping)
+- web search filter or option fields (`filters`, domain allow/deny lists,
+  `enable_image_understanding`, `enable_image_search`, and similar)
+- X search handle/date/media options
+
+When web search builtins are admitted, the gateway emits best-effort Responses
+`url_citation` annotations (including streamed
+`response.output_text.annotation.added`) for markdown links and bare `http(s)`
+URLs that appear in the assistant answer text. Cursor does not expose a
+structured search-source list through the public SDK stream, so these
+annotations are derived from the answer rather than from proprietary search
+result payloads.
+
+Clients should re-send admitted `tools` on follow-up and resume requests so
+`Agent.resume` keeps the same allowlist.
+
 ## Grok 4.7 model selection
 
 Grok 4.7 declares `reasoning_effort` in the Cursor model catalog. Responses

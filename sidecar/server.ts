@@ -708,6 +708,7 @@ async function handleAnthropicMessages(request: Request): Promise<Response> {
       sessionOwnerKey: sdkSessionOwner(apiKey),
       workingDirectory: prepared.toolContext?.workingDirectory,
       clientTools: prepared.tools,
+      builtinTools: prepared.builtinTools,
       streamEvents: prepared.stream,
       allowToolCall: (toolCall) => sdkAllowToolCall(prepared, toolCall),
       signal: request.signal
@@ -940,6 +941,7 @@ async function handleSdkRoute(
       incrementalPrompt: attempt === 0 ? incrementalPrompt : undefined,
       workingDirectory: prepared.toolContext?.workingDirectory,
       clientTools: prepared.tools,
+      builtinTools: prepared.builtinTools,
       streamEvents: prepared.stream,
       allowToolCall: (toolCall) => sdkAllowToolCall(prepared, toolCall),
       resumeToolResults: attempt === 0 ? resumeToolResults : undefined,
@@ -977,6 +979,7 @@ async function handleSdkRoute(
       includeUsage: prepared.includeUsage,
       metadata: prepared.responseMetadata,
       tools: prepared.tools,
+      citeUrlsFromText: Boolean(prepared.builtinTools?.includes("webSearch")),
       context: prepared.toolContext,
       signal: request.signal,
       failureTrace,
@@ -1051,7 +1054,8 @@ async function handleSdkRoute(
     promptChars: prepared.promptChars,
     usage: output.usage,
     phase: output.outputType === "final" ? "final_answer" : output.outputType,
-    metadata: prepared.responseMetadata
+    metadata: prepared.responseMetadata,
+    citeUrlsFromText: Boolean(prepared.builtinTools?.includes("webSearch"))
   });
   for (const toolCall of output.toolCalls) {
     if (!toolCall.trajectoryId) continue;
@@ -1138,6 +1142,7 @@ interface StreamInput {
   includeUsage: boolean;
   metadata?: Record<string, unknown>;
   tools: OpenAiToolSpec[];
+  citeUrlsFromText?: boolean;
   context?: ToolCallContext;
   signal?: AbortSignal;
   failureTrace?: FailureTraceCapture;
@@ -1320,7 +1325,8 @@ function streamOpenAiEvents(
           // Text deltas precede the Bridge's tool/terminal classification.
           // Finalize the same item with its confirmed phase for replay and progress delivery.
           phase: terminalOutput?.outputType === "final" ? "final_answer" : terminalOutput?.outputType,
-          usage
+          usage,
+          citeUrlsFromText: input.citeUrlsFromText
         })) {
           await writeEvent(event);
         }

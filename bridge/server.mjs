@@ -761,6 +761,9 @@ async function handleRequest(request, response) {
   const clientTools = resumeToolResults.length > 0 && !supersedePendingRun && !agentContext
     ? []
     : parseClientTools(body.tools);
+  const builtinTools = resumeToolResults.length > 0 && !supersedePendingRun && !agentContext
+    ? []
+    : parseBuiltinTools(body.builtinTools);
   const streamEvents = body.streamEvents === true;
   const emitReasoning = body.emitReasoning === true;
   const clientSource = normalizedClientSource(body.clientSource);
@@ -790,6 +793,7 @@ async function handleRequest(request, response) {
     emitReasoning,
     toolCount: clientTools.length,
     toolNames: clientTools.map((tool) => tool.name),
+    builtinTools,
     agentContextItems: agentContext?.transcriptItemHashes.length ?? 0
   }));
 
@@ -807,6 +811,7 @@ async function handleRequest(request, response) {
     ingressRequestId,
     trajectorySessionId,
     clientTools,
+    builtinTools,
     resumeToolResults,
     supersedePendingRun,
     supersedingTurnAborted,
@@ -1897,6 +1902,7 @@ function steeringTurnFromInput(actor, input) {
     model: input.model,
     workingDirectory: input.workingDirectory,
     clientTools: input.clientTools,
+    builtinTools: input.builtinTools,
     trajectoryInputs: steeringTrajectoryInputs(actor.activeRun, input.trajectoryInputs ?? []),
     supersedingTurnAborted: input.supersedingTurnAborted === true,
     state: "queued",
@@ -2055,6 +2061,7 @@ function startSteeringInboxRun(existing, input, onEvent, signal, onProgress, car
     model: latest.model,
     workingDirectory: latest.workingDirectory,
     clientTools: latest.clientTools,
+    builtinTools: latest.builtinTools,
     trajectoryInputs: turns.flatMap((turn) => turn.trajectoryInputs ?? []),
     incrementalPrompt: mergedSteeringPrompt(turns),
     incrementalImages: turns.flatMap((turn) => turn.images ?? []),
@@ -4525,8 +4532,31 @@ async function captureActiveClientToolCall(cacheKey, toolCall) {
   return false;
 }
 
+const ADMITTED_BUILTIN_TOOLS = new Set(["webSearch", "webFetch"]);
+
+function parseBuiltinTools(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new HttpError("builtinTools must be an array.", 400, "invalid_request");
+  }
+  const tools = [];
+  const seen = new Set();
+  for (const entry of value) {
+    if (typeof entry !== "string" || !ADMITTED_BUILTIN_TOOLS.has(entry)) {
+      throw new HttpError(`Unsupported builtin tool: ${String(entry)}.`, 400, "invalid_request");
+    }
+    if (seen.has(entry)) continue;
+    seen.add(entry);
+    tools.push(entry);
+  }
+  return tools;
+}
+
 function localAgentCreateOptions(input) {
   const systemPrompt = optionalSystemPrompt(input.systemPrompt);
+  const builtinTools = Array.isArray(input.builtinTools)
+    ? input.builtinTools.filter((tool) => ADMITTED_BUILTIN_TOOLS.has(tool))
+    : [];
   return {
     apiKey: input.apiKey,
     ...(systemPrompt === undefined ? {} : { systemPrompt }),
@@ -4535,8 +4565,9 @@ function localAgentCreateOptions(input) {
     name: "cursor2response local bridge",
     // Restrict the model to the MCP tool family (which includes
     // local.customTools) so Composer cannot bypass forwarded client tools
-    // with built-in shell/read/edit calls.
-    tools: ["mcp"],
+    // with built-in shell/read/edit calls. Optional Cursor builtins such as
+    // webSearch are appended only when the client admitted them.
+    tools: ["mcp", ...builtinTools],
     local: {
       cwd: process.env.CURSOR_SDK_WORKING_DIRECTORY?.trim() || input.workingDirectory,
       settingSources: []

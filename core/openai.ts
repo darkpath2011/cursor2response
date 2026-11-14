@@ -5,6 +5,8 @@ import type { CursorImage, CursorPrompt, CursorToolCall } from "./types.ts";
 
 export type ApiKind = "chat" | "responses";
 
+export type BuiltinToolName = "webSearch" | "webFetch";
+
 export interface PreparedRequest {
   model: string;
   cursorModel?: { id: string };
@@ -15,6 +17,7 @@ export interface PreparedRequest {
   promptChars: number;
   responseMetadata: Record<string, unknown>;
   tools: OpenAiToolSpec[];
+  builtinTools?: BuiltinToolName[];
   previousResponseId?: string;
   responseInputItems?: unknown[];
   trajectoryUserInputs?: string[];
@@ -489,12 +492,15 @@ export function prepareResponsesRequest(
   }
   const systemPrompt = typeof record.system_prompt === "string" ? record.system_prompt : undefined;
 
-  const tools = record.tool_choice === "none"
-    ? []
-    : dedupeToolSpecs([
-        ...parseChatTools(record.tools),
-        ...parseChatTools(responseAdditionalTools(record.input))
-      ]);
+  const partitioned = record.tool_choice === "none"
+    ? emptyToolPartition()
+    : mergeToolPartitions(
+        partitionRequestTools(record.tools),
+        partitionRequestTools(responseAdditionalTools(record.input) ?? [])
+      );
+  const tools = dedupeToolSpecs(partitioned.tools);
+  const builtinTools = partitioned.builtinTools;
+  const agentMode = tools.length > 0 || builtinTools.length > 0;
   const toolContext = toolCallContextFromResponseInput(record.input, record.instructions);
   const model = typeof record.model === "string" && record.model.trim() ? record.model.trim() : "composer-2.5";
   const transcript: string[] = [
@@ -524,12 +530,16 @@ export function prepareResponsesRequest(
   const previousResponseId = typeof record.previous_response_id === "string" && record.previous_response_id.trim()
     ? record.previous_response_id.trim()
     : undefined;
+  const responseTools = [
+    ...partitioned.admittedServerTools.map((tool) => ({ type: tool.type })),
+    ...responseToolMetadata(tools)
+  ];
   return {
     model,
     cursorModel,
     prompt: {
       text: prompt,
-      mode: tools.length ? "agent" : "ask",
+      mode: agentMode ? "agent" : "ask",
       ...(renderedInput.images.length ? { images: renderedInput.images } : {})
     },
     stream: record.stream === true,
@@ -544,9 +554,10 @@ export function prepareResponsesRequest(
       text: isRecord(record.text) ? record.text : { format: { type: "text" } },
       previous_response_id: previousResponseId || null,
       store: false,
-      ...(tools.length ? { tools: responseToolMetadata(tools), tool_choice: responseToolChoiceMetadata(record.tool_choice) } : {})
+      ...(responseTools.length ? { tools: responseTools, tool_choice: responseToolChoiceMetadata(record.tool_choice) } : {})
     },
     tools,
+    ...(builtinTools.length ? { builtinTools } : {}),
     previousResponseId,
     responseInputItems: normalizedResponseInputItems(record.input),
     trajectoryUserInputs: responsesTrajectoryUserInputs(record.input),
@@ -598,6 +609,63 @@ export function chatCompletionResponse(input: {
   };
 }
 
+export interface UrlCitationAnnotation {
+  type: "url_citation";
+  start_index: number;
+  end_index: number;
+  url: string;
+  title: string;
+}
+
+/** Best-effort citations from answer text. Cursor search builtins do not expose
+ * structured source lists, so markdown links and bare http(s) URLs in the
+ * assistant text are mapped to Responses `url_citation` annotations. */
+export function urlCitationsFromText(text: string): UrlCitationAnnotation[] {
+  if (!text) return [];
+  const citations: UrlCitationAnnotation[] = [];
+  const seen = new Set<string>();
+  const markdownLink = /\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/gi;
+  for (const match of text.matchAll(markdownLink)) {
+    const url = match[2];
+    const start = match.index ?? 0;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    citations.push({
+      type: "url_citation",
+      start_index: start,
+      end_index: start + match[0].length,
+      url,
+      title: match[1].trim() || urlCitationTitle(url)
+    });
+  }
+  const bareUrl = /https?:\/\/[^\s\]<>"'`]+/gi;
+  for (const match of text.matchAll(bareUrl)) {
+    const raw = match[0];
+    const url = raw.replace(/[.,;:!?)]+$/u, "");
+    if (!url || seen.has(url)) continue;
+    const start = match.index ?? 0;
+    const end = start + url.length;
+    if (citations.some((citation) => start >= citation.start_index && start < citation.end_index)) continue;
+    seen.add(url);
+    citations.push({
+      type: "url_citation",
+      start_index: start,
+      end_index: end,
+      url,
+      title: urlCitationTitle(url)
+    });
+  }
+  return citations.sort((left, right) => left.start_index - right.start_index);
+}
+
+function urlCitationTitle(url: string): string {
+  try {
+    return new URL(url).hostname || url;
+  } catch {
+    return url;
+  }
+}
+
 export function responseObject(input: {
   id: string;
   created: number;
@@ -608,8 +676,12 @@ export function responseObject(input: {
   promptChars: number;
   usage?: CursorUsage;
   metadata?: Record<string, unknown>;
+  citeUrlsFromText?: boolean;
+  annotations?: UrlCitationAnnotation[];
 }): Record<string, unknown> {
   const messageId = `msg_${input.id.slice(5)}`;
+  const annotations = input.annotations
+    ?? (input.citeUrlsFromText ? urlCitationsFromText(input.text) : []);
   const output: Record<string, unknown>[] = [];
   if (input.text || !input.toolCalls?.length) {
     output.push({
@@ -622,7 +694,7 @@ export function responseObject(input: {
         {
           type: "output_text",
           text: input.text,
-          annotations: []
+          annotations
         }
       ]
     });
@@ -969,29 +1041,46 @@ export function responseDoneEvents(input: {
   metadata?: Record<string, unknown>;
   textStarted?: boolean;
   textOutputIndex?: number;
+  citeUrlsFromText?: boolean;
+  annotations?: UrlCitationAnnotation[];
 }): Uint8Array[] {
   const itemId = `msg_${input.id.slice(5)}`;
-  const part = { type: "output_text", text: input.text, annotations: [] };
+  const annotations = input.annotations
+    ?? (input.citeUrlsFromText ? urlCitationsFromText(input.text) : []);
+  const part = { type: "output_text", text: input.text, annotations };
   const item = {
     id: itemId, type: "message", status: "completed", role: "assistant",
     ...(input.phase ? { phase: input.phase } : {}),
     content: [part]
   };
+  const outputIndex = input.textOutputIndex ?? 0;
+  const annotationEvents = annotations.map((annotation, annotationIndex) => encodeSse(
+    {
+      type: "response.output_text.annotation.added",
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: 0,
+      annotation_index: annotationIndex,
+      annotation
+    },
+    "response.output_text.annotation.added"
+  ));
   const textEvents = input.textStarted || !(input.toolCalls ?? []).length ? [
+    ...annotationEvents,
     encodeSse(
-      { type: "response.output_text.done", item_id: itemId, output_index: input.textOutputIndex ?? 0, content_index: 0, text: input.text },
+      { type: "response.output_text.done", item_id: itemId, output_index: outputIndex, content_index: 0, text: input.text },
       "response.output_text.done"
     ),
     encodeSse(
-      { type: "response.content_part.done", item_id: itemId, output_index: input.textOutputIndex ?? 0, content_index: 0, part },
+      { type: "response.content_part.done", item_id: itemId, output_index: outputIndex, content_index: 0, part },
       "response.content_part.done"
     ),
-    encodeSse({ type: "response.output_item.done", output_index: input.textOutputIndex ?? 0, item }, "response.output_item.done")
+    encodeSse({ type: "response.output_item.done", output_index: outputIndex, item }, "response.output_item.done")
   ] : [];
   return [
     ...textEvents,
     encodeSse(
-      { type: "response.completed", response: responseObject(input) },
+      { type: "response.completed", response: responseObject({ ...input, annotations }) },
       "response.completed"
     )
   ];
@@ -1122,15 +1211,92 @@ export function completionCharsFromOutput(text: string, toolCalls: OpenAiToolCal
   return text.length + serializedToolCallLength(toolCalls);
 }
 
+type AdmittedServerTool = { type: "web_search" | "web_search_preview" };
+
+type ToolPartition = {
+  tools: OpenAiToolSpec[];
+  builtinTools: BuiltinToolName[];
+  admittedServerTools: AdmittedServerTool[];
+};
+
+const WEB_SEARCH_SERVER_TYPES = new Set(["web_search", "web_search_preview"]);
+const CURSOR_WEB_SEARCH_BUILTIN_TOOLS: BuiltinToolName[] = ["webSearch", "webFetch"];
+
+function emptyToolPartition(): ToolPartition {
+  return { tools: [], builtinTools: [], admittedServerTools: [] };
+}
+
+function mergeToolPartitions(...parts: ToolPartition[]): ToolPartition {
+  const tools: OpenAiToolSpec[] = [];
+  const builtinTools: BuiltinToolName[] = [];
+  const admittedServerTools: AdmittedServerTool[] = [];
+  const seenBuiltin = new Set<BuiltinToolName>();
+  const seenServer = new Set<string>();
+  for (const part of parts) {
+    tools.push(...part.tools);
+    for (const name of part.builtinTools) {
+      if (seenBuiltin.has(name)) continue;
+      seenBuiltin.add(name);
+      builtinTools.push(name);
+    }
+    for (const tool of part.admittedServerTools) {
+      if (seenServer.has(tool.type)) continue;
+      seenServer.add(tool.type);
+      admittedServerTools.push(tool);
+    }
+  }
+  return { tools, builtinTools, admittedServerTools };
+}
+
 function parseChatTools(value: unknown): OpenAiToolSpec[] {
-  if (value === undefined) return [];
+  return partitionRequestTools(value).tools;
+}
+
+function partitionRequestTools(value: unknown): ToolPartition {
+  if (value === undefined) return emptyToolPartition();
   if (!Array.isArray(value)) throw new HttpError("tools must be an array.", 400, "invalid_request_error", "tools");
-  return value.flatMap((tool, index) => {
-    const record = expectRecord(tool, `tools[${index}]`);
+  const tools: OpenAiToolSpec[] = [];
+  const admittedServerTools: AdmittedServerTool[] = [];
+  let wantsWebSearch = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const record = expectRecord(value[index], `tools[${index}]`);
     const type = typeof record.type === "string" ? record.type.trim() : "";
     if (type === "namespace") {
       const namespace = typeof record.name === "string" ? normalizeToolName(record.name) : "";
-      return namespace === "functions" ? parseChatTools(record.tools) : [];
+      if (namespace === "functions") {
+        const nested = partitionRequestTools(record.tools);
+        tools.push(...nested.tools);
+        if (nested.builtinTools.length) wantsWebSearch = true;
+        for (const tool of nested.admittedServerTools) {
+          if (!admittedServerTools.some((entry) => entry.type === tool.type)) admittedServerTools.push(tool);
+        }
+      }
+      continue;
+    }
+    if (type === "x_search") {
+      throw new HttpError(
+        "x_search is not supported by the Cursor SDK bridge.",
+        400,
+        "unsupported_parameter",
+        `tools[${index}].type`
+      );
+    }
+    if (WEB_SEARCH_SERVER_TYPES.has(type)) {
+      const unsupportedKey = Object.keys(record).find((key) => key !== "type");
+      if (unsupportedKey) {
+        throw new HttpError(
+          `web_search options are not supported (${unsupportedKey}).`,
+          400,
+          "unsupported_parameter",
+          `tools[${index}].${unsupportedKey}`
+        );
+      }
+      wantsWebSearch = true;
+      const admittedType = type as AdmittedServerTool["type"];
+      if (!admittedServerTools.some((entry) => entry.type === admittedType)) {
+        admittedServerTools.push({ type: admittedType });
+      }
+      continue;
     }
     const fn = isRecord(record.function) ? record.function : record;
     const name = typeof fn.name === "string" && fn.name.trim()
@@ -1139,7 +1305,7 @@ function parseChatTools(value: unknown): OpenAiToolSpec[] {
         ? record.name.trim()
         : "";
     if (!name) {
-      if (type && type !== "function") return [];
+      if (type && type !== "function") continue;
       throw new HttpError("Tool function name is required.", 400, "invalid_request_error", `tools[${index}].function.name`);
     }
     const rawDescription = typeof fn.description === "string"
@@ -1167,13 +1333,18 @@ function parseChatTools(value: unknown): OpenAiToolSpec[] {
             additionalProperties: false
           }
         : undefined);
-    return [{
+    tools.push({
       name,
       ...(description ? { description } : {}),
       ...(parameters !== undefined ? { parameters } : {}),
       ...parseToolMetadata(fn, record, index)
-    }];
-  });
+    });
+  }
+  return {
+    tools,
+    builtinTools: wantsWebSearch ? [...CURSOR_WEB_SEARCH_BUILTIN_TOOLS] : [],
+    admittedServerTools
+  };
 }
 
 function parseToolMetadata(fn: Record<string, unknown>, record: Record<string, unknown>, index: number): Pick<OpenAiToolSpec, "outputSchema" | "annotations"> {

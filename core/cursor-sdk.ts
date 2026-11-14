@@ -1,7 +1,7 @@
 import { sha256Hex } from "./crypto.ts";
 import { HttpError } from "./http.ts";
 import type { CursorCollectedOutput, CursorTextEvent, CursorUsage } from "./cursor.ts";
-import type { OpenAiToolSpec, ResponsesAgentContextSource } from "./openai.ts";
+import type { BuiltinToolName, OpenAiToolSpec, ResponsesAgentContextSource } from "./openai.ts";
 import type { CursorImage, CursorToolCall, Deps, Env } from "./types.ts";
 
 export class CursorSdkContextOverflowError extends HttpError {
@@ -84,6 +84,7 @@ interface CursorSdkBridgeRunInput {
   modelId: string;
   workingDirectory?: string;
   clientTools?: ClientToolSpec[];
+  builtinTools?: BuiltinToolName[];
   allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
   incrementalPrompt?: string;
   resumeToolResults?: CursorSdkToolResult[];
@@ -256,6 +257,7 @@ export async function createCursorSdkCompletion(
     sessionOwnerKey?: string;
     workingDirectory?: string;
     clientTools?: ClientToolSpec[];
+    builtinTools?: BuiltinToolName[];
     allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
     resumeToolResults?: CursorSdkToolResult[];
     supersedePendingRun?: boolean;
@@ -317,6 +319,7 @@ export async function createCursorSdkCompletion(
     modelId: input.model?.id || "composer-2.5",
     workingDirectory: input.workingDirectory,
     clientTools: input.clientTools,
+    builtinTools: input.builtinTools,
     allowToolCall: input.allowToolCall,
     incrementalPrompt: input.incrementalPrompt?.text,
     resumeToolResults: input.resumeToolResults,
@@ -774,6 +777,7 @@ async function cursorLocalSdkBridgeJson(
     modelId: string;
     workingDirectory?: string;
     clientTools?: ClientToolSpec[];
+    builtinTools?: BuiltinToolName[];
     incrementalPrompt?: string;
     resumeToolResults?: CursorSdkToolResult[];
     supersedePendingRun?: boolean;
@@ -815,6 +819,7 @@ async function cursorLocalSdkBridgeResponse(
     modelId: string;
     workingDirectory?: string;
     clientTools?: ClientToolSpec[];
+    builtinTools?: BuiltinToolName[];
     incrementalPrompt?: string;
     resumeToolResults?: CursorSdkToolResult[];
     supersedePendingRun?: boolean;
@@ -835,6 +840,7 @@ async function cursorLocalSdkBridgeResponse(
   streamEvents: boolean
 ): Promise<CursorSdkBridgeResponse> {
   const resuming = Boolean(input.resumeToolResults?.length) && input.supersedePendingRun !== true;
+  const builtinTools = bridgeBuiltinTools(input.builtinTools);
   const body = JSON.stringify({
     apiKey,
     requestId: input.runId,
@@ -847,14 +853,16 @@ async function cursorLocalSdkBridgeResponse(
         ? {
             prompt: input.prompt,
             promptAlreadyPrepared: true,
-            tools: bridgeClientTools(input.clientTools)
+            tools: bridgeClientTools(input.clientTools),
+            ...(builtinTools.length ? { builtinTools } : {})
           }
         : {}
       : {
           prompt: input.prompt,
           promptAlreadyPrepared: true,
           incrementalPrompt: input.incrementalPrompt,
-          tools: bridgeClientTools(input.clientTools)
+          tools: bridgeClientTools(input.clientTools),
+          ...(builtinTools.length ? { builtinTools } : {})
         }),
     images: input.images,
     incrementalImages: input.incrementalImages,
@@ -1170,6 +1178,20 @@ function bridgeClientTools(tools: ClientToolSpec[] | undefined): ClientToolSpec[
       ...(tool.annotations !== undefined ? { annotations: tool.annotations } : {})
     }];
   });
+}
+
+const BRIDGE_BUILTIN_TOOLS = new Set<BuiltinToolName>(["webSearch", "webFetch"]);
+
+function bridgeBuiltinTools(tools: BuiltinToolName[] | undefined): BuiltinToolName[] {
+  if (!tools?.length) return [];
+  const admitted: BuiltinToolName[] = [];
+  const seen = new Set<BuiltinToolName>();
+  for (const tool of tools) {
+    if (!BRIDGE_BUILTIN_TOOLS.has(tool) || seen.has(tool)) continue;
+    seen.add(tool);
+    admitted.push(tool);
+  }
+  return admitted;
 }
 
 function cursorLocalSdkBridgeHeaders(env: Env): Headers {

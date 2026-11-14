@@ -17,7 +17,8 @@ import {
   responseToolResults,
   responseToolResultsCanReplay,
   toolCallRetryHint,
-  toOpenAiToolCalls
+  toOpenAiToolCalls,
+  urlCitationsFromText
 } from "./openai.ts";
 
 describe("Responses assistant phases", () => {
@@ -1320,7 +1321,7 @@ describe("OpenAI compatibility adapter", () => {
     expect(prepared.prompt.text).not.toContain("SDK TOOL ROUTING MAP:");
   });
 
-  it("accepts server tool schemas and skips nameless built-in response tools", () => {
+  it("accepts bare web_search_preview as Cursor builtin search with named server tools", () => {
     const prepared = prepareResponsesRequest(
       {
         model: "composer-2.5",
@@ -1357,8 +1358,11 @@ describe("OpenAI compatibility adapter", () => {
         }
       }
     ]);
+    expect(prepared.builtinTools).toEqual(["webSearch", "webFetch"]);
+    expect(prepared.prompt.mode).toBe("agent");
     expect(prepared.prompt.text).not.toContain("LOCAL TOOL INVENTORY:");
     expect(prepared.responseMetadata.tools).toEqual([
+      { type: "web_search_preview" },
       {
         type: "function",
         name: "repo_search",
@@ -1372,6 +1376,117 @@ describe("OpenAI compatibility adapter", () => {
         }
       }
     ]);
+  });
+
+  it("maps answer URLs to Responses url_citation annotations when citeUrlsFromText is set", () => {
+    const text = "See [Cursor SDK](https://cursor.com/docs/sdk/typescript) and https://example.com/news.";
+    expect(urlCitationsFromText(text)).toEqual([
+      {
+        type: "url_citation",
+        start_index: 4,
+        end_index: 4 + "[Cursor SDK](https://cursor.com/docs/sdk/typescript)".length,
+        url: "https://cursor.com/docs/sdk/typescript",
+        title: "Cursor SDK"
+      },
+      {
+        type: "url_citation",
+        start_index: text.indexOf("https://example.com/news."),
+        end_index: text.indexOf("https://example.com/news.") + "https://example.com/news".length,
+        url: "https://example.com/news",
+        title: "example.com"
+      }
+    ]);
+
+    const response = responseObject({
+      id: "resp_cite",
+      created: 1,
+      model: "composer-2.5",
+      text,
+      promptChars: 1,
+      citeUrlsFromText: true
+    });
+    const part = (response.output as Array<{ content: Array<{ annotations: unknown[] }> }>)[0].content[0];
+    expect(part.annotations).toHaveLength(2);
+
+    const events = responseDoneEvents({
+      id: "resp_cite",
+      created: 1,
+      model: "composer-2.5",
+      text,
+      promptChars: 1,
+      textStarted: true,
+      citeUrlsFromText: true
+    }).map((bytes) => {
+      const data = new TextDecoder().decode(bytes).split("\n").find((line) => line.startsWith("data: "))!;
+      return JSON.parse(data.slice(6));
+    });
+    expect(events.filter((event) => event.type === "response.output_text.annotation.added")).toHaveLength(2);
+    expect(events.find((event) => event.type === "response.content_part.done").part.annotations).toHaveLength(2);
+  });
+
+  it("admits bare web_search as Cursor builtin search without client function tools", () => {
+    const prepared = prepareResponsesRequest(
+      {
+        model: "composer-2.5",
+        input: "search recent Cursor SDK news",
+        tools: [{ type: "web_search" }],
+        stream: true,
+        store: false
+      },
+      { id: "composer-2.5" }
+    );
+
+    expect(prepared.tools).toEqual([]);
+    expect(prepared.builtinTools).toEqual(["webSearch", "webFetch"]);
+    expect(prepared.prompt.mode).toBe("agent");
+    expect(prepared.responseMetadata.tools).toEqual([{ type: "web_search" }]);
+    expect(prepared.responseMetadata.tool_choice).toBe("auto");
+  });
+
+  it("rejects x_search as an unsupported Responses server tool", () => {
+    let caught: unknown;
+    try {
+      prepareResponsesRequest(
+        {
+          model: "composer-2.5",
+          input: "search X",
+          tools: [{ type: "x_search" }]
+        },
+        { id: "composer-2.5" }
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({
+      status: 400,
+      code: "unsupported_parameter",
+      param: "tools[0].type"
+    });
+  });
+
+  it("rejects web_search filter and option fields", () => {
+    const unsupported = [
+      { tool: { type: "web_search", filters: { allowed_domains: ["example.com"] } }, param: "tools[0].filters" },
+      { tool: { type: "web_search", enable_image_understanding: true }, param: "tools[0].enable_image_understanding" },
+      { tool: { type: "web_search_preview", excluded_domains: ["example.com"] }, param: "tools[0].excluded_domains" }
+    ];
+
+    for (const { tool, param } of unsupported) {
+      let caught: unknown;
+      try {
+        prepareResponsesRequest(
+          { model: "composer-2.5", input: "search", tools: [tool] },
+          { id: "composer-2.5" }
+        );
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toMatchObject({
+        status: 400,
+        code: "unsupported_parameter",
+        param
+      });
+    }
   });
 
   it("supports Codex Code Mode tools from Responses additional_tools items", () => {
